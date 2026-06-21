@@ -10,7 +10,25 @@ import {
 import { noopLogger } from './logger.js';
 import type { AIOperationQueue } from './queue.js';
 import { recordCallUsage } from './telemetry.js';
-import { isAIAbortError } from './queue.js';
+import { isAIAbortError, AIOperationCancelledError } from './queue.js';
+
+// ---------------------------------------------------------------------------
+// AbortSignal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * RN-safe replacement for `AbortSignal.prototype.throwIfAborted()`, which is
+ * not implemented in React Native / Hermes. Throws the signal's abort reason
+ * (or a generic cancellation error) when the signal is already aborted.
+ */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+    if (!signal?.aborted) return;
+    const reason = (signal as AbortSignal & { reason?: unknown }).reason;
+    if (reason instanceof Error) throw reason;
+    throw new AIOperationCancelledError(
+        typeof reason === 'string' ? reason : undefined,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // StructuredOutputError
@@ -134,7 +152,7 @@ export async function structured<T extends ZodTypeAny>(
 
     try {
         for (let attempt = 0; attempt < totalAttempts; attempt++) {
-            callSignal?.throwIfAborted();
+            throwIfAborted(callSignal);
 
             if (attempt > 0) {
                 const reason =
@@ -244,7 +262,7 @@ export async function text(
     logger.debug(`text "${params.preset}"`);
 
     try {
-        callSignal?.throwIfAborted();
+        throwIfAborted(callSignal);
 
         const result = await client.chat(preset, messages, {
             web: params.web,

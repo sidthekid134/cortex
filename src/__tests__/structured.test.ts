@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { structured, text, StructuredOutputError } from '../structured.js';
-import { AIOperationQueue } from '../queue.js';
+import { AIOperationQueue, isAIAbortError } from '../queue.js';
 import { OpenRouterClient } from '../openrouter.js';
 import type { PresetMap, UsageEvent } from '../types.js';
 import { DEFAULT_PRESETS } from '../presets.js';
@@ -352,6 +352,40 @@ describe('structured() — error cases', () => {
                 q,
             ),
         ).rejects.toThrow();
+    });
+
+    // React Native / Hermes does not implement AbortSignal.prototype.throwIfAborted.
+    // We must detect an aborted signal without relying on that method.
+    it('detects an aborted signal when throwIfAborted is unavailable (RN/Hermes)', async () => {
+        const original = (AbortSignal.prototype as { throwIfAborted?: unknown }).throwIfAborted;
+        // Simulate the React Native runtime where the method does not exist.
+        delete (AbortSignal.prototype as { throwIfAborted?: unknown }).throwIfAborted;
+
+        try {
+            const spy = mockChat([JSON.stringify(VALID_RESPONSE)]);
+            const q = makeQueue();
+            const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
+            const controller = new AbortController();
+            controller.abort();
+
+            const err = await structured(
+                { preset: 'fast-vision', schema: TestSchema, prompt: 'test', signal: controller.signal },
+                makePresets(),
+                client,
+                q,
+            ).catch((e) => e);
+
+            // Must reject with a genuine cancellation — NOT a TypeError from
+            // calling a missing throwIfAborted method. This is what fails if the
+            // code reverts to `signal.throwIfAborted()`.
+            expect(err).toBeInstanceOf(Error);
+            expect((err as Error).name).not.toBe('TypeError');
+            expect(isAIAbortError(err)).toBe(true);
+            // The call must short-circuit before ever hitting the network.
+            expect(spy).not.toHaveBeenCalled();
+        } finally {
+            (AbortSignal.prototype as { throwIfAborted?: unknown }).throwIfAborted = original;
+        }
     });
 
     it('wraps underlying network error in StructuredOutputError after exhausting retries', async () => {
