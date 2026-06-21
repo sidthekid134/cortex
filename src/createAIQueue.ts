@@ -180,10 +180,10 @@ export function createAIQueue(config: CortexConfig): CortexInstance {
     // Config validation
     // ------------------------------------------------------------------
 
-    if (!config.apiKey || typeof config.apiKey !== 'string') {
-        throw new Error('[cortex] createAIQueue: apiKey is required and must be a non-empty string');
-    }
-
+    // Defer apiKey validation to the first actual LLM call so a missing key
+    // never throws synchronously during module initialisation. An uninitialised
+    // module in RN's new architecture can corrupt the Hermes GC and SIGSEGV.
+    // OpenRouterClient.chat() will throw with a clear message if the key is empty.
     const c = config.concurrency;
     if (c?.base !== undefined && (!Number.isInteger(c.base) || c.base < 1)) {
         throw new Error('[cortex] createAIQueue: concurrency.base must be a positive integer');

@@ -139,12 +139,24 @@ export class OpenRouterClient {
     constructor(cfg: OpenRouterClientConfig) {
         this.baseUrl = cfg.baseUrl.replace(/\/$/, '');
         this.logger = cfg.logger ?? noopLogger;
+        // Store the raw key — we validate it at call time so that a missing key
+        // never throws synchronously during module initialisation (which can corrupt
+        // the Hermes GC in React Native's new architecture and cause a SIGSEGV).
         this.headers = {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${cfg.apiKey}`,
+            Authorization: `Bearer ${cfg.apiKey ?? ''}`,
             ...(cfg.referer ? { 'HTTP-Referer': cfg.referer } : {}),
             ...(cfg.title ? { 'X-Title': cfg.title } : {}),
         };
+    }
+
+    private assertApiKey(): void {
+        if (this.headers['Authorization'] === 'Bearer ') {
+            throw new Error(
+                '[cortex] OPENROUTER_API_KEY is missing. ' +
+                'Set it in your .env file and rebuild the app.',
+            );
+        }
     }
 
     async chat(
@@ -156,6 +168,7 @@ export class OpenRouterClient {
             signal?: AbortSignal;
         },
     ): Promise<ChatResult> {
+        this.assertApiKey();
         const body: ChatRequest = {
             model: preset.model,
             ...(preset.fallbacks?.length ? { models: [preset.model, ...preset.fallbacks] } : {}),
@@ -238,6 +251,7 @@ export class OpenRouterClient {
             signal?: AbortSignal;
         },
     ): Promise<ToolChatResult> {
+        this.assertApiKey();
         const body: ChatRequest = {
             model: preset.model,
             ...(preset.fallbacks?.length ? { models: [preset.model, ...preset.fallbacks] } : {}),
