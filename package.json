@@ -1,6 +1,6 @@
 {
   "name": "@sid/cortex",
-  "version": "0.2.2",
+  "version": "0.1.0",
   "description": "UX-aware LLM operation queue + OpenRouter call layer for client apps (React Native / Expo friendly).",
   "license": "MIT",
   "type": "module",
