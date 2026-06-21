@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
-import { structured, text } from '../structured.js';
+import { structured, text, StructuredOutputError } from '../structured.js';
 import { AIOperationQueue } from '../queue.js';
 import { OpenRouterClient } from '../openrouter.js';
 import type { PresetMap, UsageEvent } from '../types.js';
@@ -215,19 +215,22 @@ describe('structured() — retry', () => {
         expect((lastMsg.content as string).toLowerCase()).toContain('previous response');
     });
 
-    it('throws after all retries are exhausted', async () => {
+    it('throws StructuredOutputError after all retries are exhausted', async () => {
         mockChat(['bad', 'also bad']);
         const q = makeQueue();
         const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
 
-        await expect(
-            structured(
-                { preset: 'fast-vision', schema: TestSchema, prompt: 'test', maxRetries: 1 },
-                makePresets(),
-                client,
-                q,
-            ),
-        ).rejects.toThrow();
+        const err = await structured(
+            { preset: 'fast-vision', schema: TestSchema, prompt: 'test', maxRetries: 1 },
+            makePresets(),
+            client,
+            q,
+        ).catch((e) => e);
+
+        expect(err).toBeInstanceOf(StructuredOutputError);
+        expect((err as StructuredOutputError).preset).toBe('fast-vision');
+        expect((err as StructuredOutputError).attempts).toBe(2);
+        expect((err as StructuredOutputError).cause).toBeDefined();
     });
 
     it('does not retry when maxRetries is 0', async () => {
@@ -351,19 +354,22 @@ describe('structured() — error cases', () => {
         ).rejects.toThrow();
     });
 
-    it('propagates error from the underlying chat call', async () => {
+    it('wraps underlying network error in StructuredOutputError after exhausting retries', async () => {
         vi.spyOn(OpenRouterClient.prototype, 'chat').mockRejectedValue(new Error('network error'));
         const q = makeQueue();
         const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
 
-        await expect(
-            structured(
-                { preset: 'fast-vision', schema: TestSchema, prompt: 'test' },
-                makePresets(),
-                client,
-                q,
-            ),
-        ).rejects.toThrow('network error');
+        const err = await structured(
+            { preset: 'fast-vision', schema: TestSchema, prompt: 'test', maxRetries: 0 },
+            makePresets(),
+            client,
+            q,
+        ).catch((e) => e);
+
+        expect(err).toBeInstanceOf(StructuredOutputError);
+        // The original network error should be accessible via .cause
+        expect((err as StructuredOutputError).cause).toBeInstanceOf(Error);
+        expect(((err as StructuredOutputError).cause as Error).message).toContain('network error');
     });
 });
 
@@ -440,6 +446,103 @@ describe('text()', () => {
 
         const opts = spy.mock.calls[0][2];
         expect(opts?.responseFormat).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// timeoutMs support
+// ---------------------------------------------------------------------------
+
+describe('structured() — timeoutMs', () => {
+    beforeEach(() => { vi.restoreAllMocks(); vi.useFakeTimers(); });
+    // eslint-disable-next-line vitest/no-hooks-in-describe
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('rejects when the call exceeds timeoutMs', async () => {
+        // Signal-aware mock so the abort from the timeout actually rejects the call
+        vi.spyOn(OpenRouterClient.prototype, 'chat').mockImplementation(
+            (_preset, _messages, options) =>
+                new Promise((_resolve, reject) => {
+                    const sig = options?.signal;
+                    if (sig?.aborted) { reject(sig.reason); return; }
+                    sig?.addEventListener('abort', () => reject(sig.reason), { once: true });
+                }),
+        );
+
+        const q = makeQueue();
+        const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
+
+        const promise = structured(
+            { preset: 'fast-vision', schema: TestSchema, prompt: 'test', timeoutMs: 1000, maxRetries: 0 },
+            makePresets(),
+            client,
+            q,
+        );
+        // Suppress the "handled asynchronously" Node.js warning — the rejection
+        // is intentional and caught below.
+        promise.catch(() => {});
+
+        // Advance past the timeout so the internal AbortController fires
+        await vi.advanceTimersByTimeAsync(1100);
+
+        await expect(promise).rejects.toThrow();
+    });
+
+    it('does not time out when the call completes within timeoutMs', async () => {
+        mockChat([JSON.stringify(VALID_RESPONSE)]);
+        vi.useRealTimers();
+
+        const q = makeQueue();
+        const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
+
+        const result = await structured(
+            { preset: 'fast-vision', schema: TestSchema, prompt: 'test', timeoutMs: 5000 },
+            makePresets(),
+            client,
+            q,
+        );
+
+        expect(result).toEqual(VALID_RESPONSE);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// abort never retries
+// ---------------------------------------------------------------------------
+
+describe('structured() — abort does not retry', () => {
+    beforeEach(() => { vi.restoreAllMocks(); });
+
+    it('propagates AbortError immediately without retrying', async () => {
+        const controller = new AbortController();
+        let callCount = 0;
+
+        vi.spyOn(OpenRouterClient.prototype, 'chat').mockImplementation(async () => {
+            callCount++;
+            controller.abort();
+            throw new Error('The operation was aborted');
+        });
+
+        const q = makeQueue();
+        const client = new OpenRouterClient({ apiKey: 'k', baseUrl: 'http://x' });
+
+        await expect(
+            structured(
+                {
+                    preset: 'fast-vision',
+                    schema: TestSchema,
+                    prompt: 'test',
+                    signal: controller.signal,
+                    maxRetries: 3, // would retry 3 times if abort was not special-cased
+                },
+                makePresets(),
+                client,
+                q,
+            ),
+        ).rejects.toThrow();
+
+        // Should only have been called once — abort short-circuits retries
+        expect(callCount).toBe(1);
     });
 });
 

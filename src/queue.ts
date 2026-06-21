@@ -15,6 +15,10 @@ const yieldToUI = (): Promise<void> => new Promise<void>((resolve) => setTimeout
 // Cancellation error
 // ---------------------------------------------------------------------------
 
+/**
+ * Thrown when an operation is cancelled via `cancelGroup()`, `cancelKey()`,
+ * or `destroy()`. Also used as the abort reason on `ctx.signal`.
+ */
 export class AIOperationCancelledError extends Error {
     constructor(message = 'AI operation cancelled') {
         super(message);
@@ -22,6 +26,11 @@ export class AIOperationCancelledError extends Error {
     }
 }
 
+/**
+ * Returns `true` for any cancellation-originated error, whether it came from
+ * `AIOperationCancelledError`, a browser `AbortError`, or a signal abort.
+ * Use this to distinguish intentional cancellations from real failures.
+ */
 export const isAIAbortError = (error: unknown): boolean => {
     if (error instanceof AIOperationCancelledError) return true;
     if (error instanceof Error) {
@@ -67,14 +76,13 @@ interface ResolvedQueueConfig {
     slowOpConcurrency: number;
     interactiveThreshold: number;
     logger: Logger;
-    onEvent?: (event: QueueEvent) => void;
 }
 
 // ---------------------------------------------------------------------------
-// Usage totals (written into QueueStats)
+// Usage totals (internal — aggregated into QueueStats)
 // ---------------------------------------------------------------------------
 
-export interface UsageTotals {
+interface UsageTotals {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
@@ -85,6 +93,16 @@ export interface UsageTotals {
 // AIOperationQueue
 // ---------------------------------------------------------------------------
 
+/**
+ * Priority-aware, deduplication-supporting operation queue for async LLM tasks.
+ *
+ * Operations are scheduled by priority and focused-group status. Slow operations
+ * are limited to a separate concurrency cap so fast operations are never starved.
+ * Cancellation propagates through `AbortSignal` on each task's context.
+ *
+ * Prefer using the `CortexInstance` returned by `createAIQueue()` rather than
+ * instantiating this class directly.
+ */
 export class AIOperationQueue {
     private queue: QueuedOperation<unknown>[] = [];
     private running = new Map<number, RunningOperation>();
@@ -101,6 +119,7 @@ export class AIOperationQueue {
     };
     private focusedGroup: string | null = null;
     private listeners: Set<QueueListener> = new Set();
+    private destroyed = false;
 
     private readonly cfg: ResolvedQueueConfig;
 
@@ -110,7 +129,7 @@ export class AIOperationQueue {
         this.cfg = {
             baseConcurrency: base,
             burstSlots: burst,
-            slowOpConcurrency: concurrency?.slowOp ?? base - 1,
+            slowOpConcurrency: concurrency?.slowOp ?? Math.max(1, base - 1),
             interactiveThreshold: interactiveThreshold ?? 90,
             logger: logger ?? noopLogger,
         };
@@ -121,9 +140,11 @@ export class AIOperationQueue {
     // -------------------------------------------------------------------------
 
     /**
-     * Subscribe to queue lifecycle events (queued, started, completed, etc.).
-     * Returns an unsubscribe function. Apps use this to mirror queue state into
-     * their own stores without polling getStats().
+     * Subscribe to queue lifecycle events (`queued`, `started`, `completed`, etc.).
+     * Returns an unsubscribe function. Use this to mirror queue state into your
+     * own store without polling `getStats()`.
+     *
+     * Listener errors are swallowed — a buggy listener will never crash the queue.
      */
     subscribe(listener: QueueListener): () => void {
         this.listeners.add(listener);
@@ -134,20 +155,38 @@ export class AIOperationQueue {
     // Public: enqueue
     // -------------------------------------------------------------------------
 
+    /**
+     * Add a task to the queue. The task receives an `AITaskContext` with a
+     * cancellation signal and should pass `ctx.signal` to any in-flight I/O.
+     *
+     * If an operation with the same `dedupeKey` is already pending, the new
+     * call supersedes it: the task function and priority are updated, and both
+     * promises resolve/reject together.
+     *
+     * @throws {AIOperationCancelledError} if the queue has been destroyed.
+     */
     enqueue<T>(
         label: string,
         task: (ctx: AITaskContext) => Promise<T>,
         options: AIOperationOptions = {},
     ): Promise<T> {
+        if (this.destroyed) {
+            return Promise.reject(
+                new AIOperationCancelledError('[cortex] Queue has been destroyed'),
+            );
+        }
+
         const dedupeKey = options.dedupeKey ?? label;
         const priority = options.priority ?? 0;
 
-        // If the same key is already running, attach to it or restart it.
+        // Already running — attach to the running op or restart it.
         const runningMatch = [...this.running.values()].find((e) => e.op.dedupeKey === dedupeKey);
         if (runningMatch) {
             if (options.restart) {
+                this.cfg.logger.debug(`enqueue "${label}" — restarting running op`);
                 this.abortRunning(runningMatch.op.id, 'restart');
             } else {
+                this.cfg.logger.trace(`enqueue "${label}" — attaching to running op`);
                 const runningOp = runningMatch.op;
                 runningOp.priority = Math.max(runningOp.priority, priority);
                 runningOp.label = label;
@@ -160,9 +199,10 @@ export class AIOperationQueue {
             }
         }
 
-        // If the same key is pending in the queue, bump it and replace the task.
+        // Already pending — bump priority and update the task.
         const existing = this.queue.find((op) => op.dedupeKey === dedupeKey);
         if (existing) {
+            this.cfg.logger.trace(`enqueue "${label}" — bumping pending op`);
             existing.priority = Math.max(existing.priority, priority);
             existing.label = label;
             existing.task = task as (ctx: AITaskContext) => Promise<unknown>;
@@ -179,6 +219,7 @@ export class AIOperationQueue {
             });
         }
 
+        // New operation.
         return new Promise<T>((resolve, reject) => {
             this.queue.push({
                 id: this.nextId++,
@@ -195,6 +236,9 @@ export class AIOperationQueue {
             });
             this.sortQueue();
             this.emit('queued', { label, group: options.group, priority });
+            this.cfg.logger.trace(
+                `enqueue "${label}" p${priority} — queue ${this.queue.length}, running ${this.running.size}`,
+            );
             void this.processNext();
         });
     }
@@ -205,16 +249,21 @@ export class AIOperationQueue {
 
     /**
      * Mark the group the user is actively viewing. Its queued operations are
-     * sorted to the front and may run in burst slots without cancelling
-     * already-running work.
+     * sorted to the front and are allowed to use burst concurrency slots without
+     * aborting already-running work.
      */
     setFocusedGroup(group: string | null): void {
         if (this.focusedGroup === group) return;
         this.focusedGroup = group;
+        this.cfg.logger.debug(`focusedGroup → ${group ?? 'null'}`);
         this.sortQueue();
         void this.processNext();
     }
 
+    /**
+     * Cancel all queued **and** running operations belonging to `group`.
+     * The focused group is cleared if it matches.
+     */
     cancelGroup(group: string, reason = 'group cancelled'): void {
         if (!group) return;
         if (this.focusedGroup === group) this.focusedGroup = null;
@@ -241,10 +290,13 @@ export class AIOperationQueue {
         }
 
         if (cancelled > 0) {
-            this.cfg.logger.trace(`[cortex] cancelled group ${group}: ${cancelled} op(s) — ${reason}`);
+            this.cfg.logger.debug(`cancelGroup "${group}" — ${cancelled} op(s): ${reason}`);
         }
     }
 
+    /**
+     * Cancel all queued **and** running operations matching a dedupe key.
+     */
     cancelKey(dedupeKey: string, reason = 'key cancelled'): void {
         if (!dedupeKey) return;
 
@@ -270,10 +322,14 @@ export class AIOperationQueue {
         }
 
         if (cancelled > 0) {
-            this.cfg.logger.trace(`[cortex] cancelled key "${dedupeKey}": ${cancelled} op(s) — ${reason}`);
+            this.cfg.logger.debug(`cancelKey "${dedupeKey}" — ${cancelled} op(s): ${reason}`);
         }
     }
 
+    /**
+     * Returns `true` if any operation with the given dedupe key is currently
+     * queued or running.
+     */
     hasPending(dedupeKey: string): boolean {
         if (!dedupeKey) return false;
         for (const entry of this.running.values()) {
@@ -282,10 +338,12 @@ export class AIOperationQueue {
         return this.queue.some((op) => op.dedupeKey === dedupeKey);
     }
 
+    /** Snapshot of the current queue state, including aggregate usage totals. */
     getStats(): QueueStats {
-        const first = this.running.values().next().value as RunningOperation | undefined;
+        const runningList = [...this.running.values()];
         return {
-            activeOperation: first?.op.label ?? null,
+            activeOperation: runningList[0]?.op.label ?? null,
+            runningLabels: runningList.map((e) => e.op.label),
             runningOperations: this.running.size,
             pendingOperations: this.queue.length,
             pendingByPriority: this.queue.reduce<Record<string, number>>((acc, op) => {
@@ -301,7 +359,53 @@ export class AIOperationQueue {
         };
     }
 
-    /** Called by telemetry after a completed LLM call to accumulate totals. */
+    /**
+     * Wait for all currently running and queued operations to settle (resolve or
+     * reject). Resolves immediately if the queue is already empty. Useful for
+     * testing and graceful shutdown.
+     */
+    drain(): Promise<void> {
+        if (this.running.size === 0 && this.queue.length === 0) {
+            return Promise.resolve();
+        }
+        return new Promise<void>((resolve) => {
+            const unsubscribe = this.subscribe(() => {
+                if (this.running.size === 0 && this.queue.length === 0) {
+                    unsubscribe();
+                    resolve();
+                }
+            });
+        });
+    }
+
+    /**
+     * Cancel all pending and running operations, then mark the queue as
+     * destroyed. After calling `destroy()`, `enqueue()` will throw immediately.
+     *
+     * Safe to call multiple times — subsequent calls are no-ops.
+     */
+    destroy(reason = 'queue destroyed'): void {
+        if (this.destroyed) return;
+        this.destroyed = true;
+
+        this.cfg.logger.info(`destroy — cancelling all operations: ${reason}`);
+
+        for (const op of this.queue) {
+            this.cancelledOperations++;
+            op.reject(new AIOperationCancelledError(`${op.label}: ${reason}`));
+            this.emit('cancelled', op);
+        }
+        this.queue = [];
+
+        for (const entry of this.running.values()) {
+            this.cancelledOperations++;
+            entry.controller.abort(
+                new AIOperationCancelledError(`${entry.op.label}: ${reason}`),
+            );
+        }
+    }
+
+    /** Called by telemetry after a completed LLM call to accumulate session totals. */
     recordUsage(promptTokens: number, completionTokens: number, costUsd: number | undefined): void {
         this.usageTotals.promptTokens += promptTokens;
         this.usageTotals.completionTokens += completionTokens;
@@ -345,6 +449,7 @@ export class AIOperationQueue {
                 this.skippedOperations++;
                 next.resolve(undefined);
                 this.emit('skipped', next);
+                this.cfg.logger.trace(`skipped "${next.label}" (isStillValid → false)`);
                 continue;
             }
 
@@ -356,7 +461,9 @@ export class AIOperationQueue {
         const controller = new AbortController();
         this.running.set(op.id, { op, controller });
         this.emit('started', op);
-        this.cfg.logger.trace(`[cortex] ▶ started  "${op.label}" p${op.priority} — running ${this.running.size}, waiting ${this.queue.length}`);
+        this.cfg.logger.trace(
+            `▶ "${op.label}" p${op.priority} — running ${this.running.size}, waiting ${this.queue.length}`,
+        );
 
         try {
             await yieldToUI();
@@ -368,22 +475,27 @@ export class AIOperationQueue {
 
             const result = await op.task({ signal: controller.signal });
             this.completedOperations++;
+            // Delete before emitting so drain() sees the correct running count.
+            this.running.delete(op.id);
             op.resolve(result);
             this.emit('completed', op);
-            this.cfg.logger.trace(`[cortex] ✓ complete "${op.label}"`);
+            this.cfg.logger.trace(`✓ "${op.label}"`);
         } catch (error) {
+            // Delete before emitting so drain() sees the correct running count.
+            this.running.delete(op.id);
             if (isAIAbortError(error) || controller.signal.aborted) {
                 op.reject(error instanceof Error ? error : new AIOperationCancelledError(op.label));
                 this.emit('cancelled', op);
-                this.cfg.logger.debug(`[cortex] ✕ cancelled "${op.label}"`);
+                this.cfg.logger.debug(`✕ cancelled "${op.label}"`);
             } else {
                 this.failedOperations++;
                 op.reject(error);
                 this.emit('failed', op);
-                this.cfg.logger.error(`[cortex] ✕ failed   "${op.label}"`, error);
+                this.cfg.logger.error(`✕ failed "${op.label}"`, error);
             }
         } finally {
-            this.running.delete(op.id);
+            // Guard: already deleted in the try/catch above, but keep processNext here.
+            this.running.delete(op.id); // no-op if already deleted; safe to call twice
             await yieldToUI();
             void this.processNext();
         }
@@ -409,7 +521,10 @@ export class AIOperationQueue {
         entry.controller.abort(new AIOperationCancelledError(`${entry.op.label}: ${reason}`));
     }
 
-    private emit(kind: QueueEvent['kind'], info: { label?: string; group?: string; priority?: number }): void {
+    private emit(
+        kind: QueueEvent['kind'],
+        info: { label?: string; group?: string; priority?: number },
+    ): void {
         if (this.listeners.size === 0) return;
         const event: QueueEvent = {
             kind,

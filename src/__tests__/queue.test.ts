@@ -683,6 +683,150 @@ describe('subscribe', () => {
 });
 
 // ---------------------------------------------------------------------------
+// drain
+// ---------------------------------------------------------------------------
+
+describe('drain()', () => {
+    it('resolves immediately when queue is empty', async () => {
+        const q = makeQueue();
+        await expect(q.drain()).resolves.toBeUndefined();
+    });
+
+    it('resolves after all running operations finish', async () => {
+        const q = makeQueue();
+        const d1 = deferred();
+        const d2 = deferred();
+        let drained = false;
+
+        q.enqueue('t1', () => d1.promise);
+        q.enqueue('t2', () => d2.promise);
+        await tick();
+
+        const drainP = q.drain().then(() => { drained = true; });
+
+        expect(drained).toBe(false);
+        d1.resolve();
+        d2.resolve();
+        await drainP;
+        expect(drained).toBe(true);
+    });
+
+    it('resolves after queued operations settle', async () => {
+        const q = makeQueue({ base: 1, burst: 0 });
+        const d1 = deferred();
+        const d2 = deferred();
+
+        q.enqueue('t1', () => d1.promise);
+        q.enqueue('t2', () => d2.promise);
+        await tick();
+
+        const drainP = q.drain();
+        d1.resolve();
+        await tick();
+        d2.resolve();
+        await drainP; // should resolve once both are done
+    });
+});
+
+// ---------------------------------------------------------------------------
+// destroy
+// ---------------------------------------------------------------------------
+
+describe('destroy()', () => {
+    it('cancels all pending operations', async () => {
+        const q = makeQueue({ base: 1, burst: 0 });
+        const blocker = deferred();
+
+        const p0 = q.enqueue('blocker', () => blocker.promise);
+        await tick();
+
+        const p1 = q.enqueue('pending', immediate(1));
+        p1.catch(() => {});
+
+        q.destroy('test-reason');
+        blocker.resolve(); // blocker still completes since it was running before destroy
+
+        await expect(p1).rejects.toSatisfy(isAIAbortError);
+    });
+
+    it('aborts running operations', async () => {
+        const q = makeQueue();
+        let aborted = false;
+
+        const p = q.enqueue('running', async (ctx) => {
+            const d = signalAwareDeferred(ctx.signal);
+            ctx.signal.addEventListener('abort', () => { aborted = true; });
+            return d.promise;
+        });
+        p.catch(() => {});
+
+        await tick();
+        q.destroy('shutdown');
+        await tick();
+
+        expect(aborted).toBe(true);
+        await expect(p).rejects.toSatisfy(isAIAbortError);
+    });
+
+    it('makes subsequent enqueue() calls reject immediately', async () => {
+        const q = makeQueue();
+        q.destroy();
+        await expect(q.enqueue('after-destroy', immediate(1))).rejects.toSatisfy(isAIAbortError);
+    });
+
+    it('is safe to call multiple times', () => {
+        const q = makeQueue();
+        expect(() => { q.destroy(); q.destroy(); q.destroy(); }).not.toThrow();
+    });
+
+    it('emits cancelled events for pending ops', async () => {
+        const q = makeQueue({ base: 1, burst: 0 });
+        const blocker = deferred();
+        const events: string[] = [];
+        q.subscribe((e) => events.push(e.kind));
+
+        q.enqueue('blocker', () => blocker.promise);
+        await tick();
+
+        q.enqueue('pending', immediate(1)).catch(() => {});
+        q.destroy();
+        blocker.resolve();
+        await flushQueue();
+
+        expect(events).toContain('cancelled');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// runningLabels in stats
+// ---------------------------------------------------------------------------
+
+describe('getStats().runningLabels', () => {
+    it('contains labels of all running operations', async () => {
+        const q = makeQueue({ base: 2, burst: 0 });
+        const d1 = deferred();
+        const d2 = deferred();
+
+        q.enqueue('task-alpha', () => d1.promise);
+        q.enqueue('task-beta', () => d2.promise);
+        await tick();
+
+        const { runningLabels } = q.getStats();
+        expect(runningLabels).toContain('task-alpha');
+        expect(runningLabels).toContain('task-beta');
+
+        d1.resolve();
+        d2.resolve();
+        await flushQueue();
+    });
+
+    it('is empty when nothing is running', () => {
+        const q = makeQueue();
+        expect(q.getStats().runningLabels).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // getStats
 // ---------------------------------------------------------------------------
 

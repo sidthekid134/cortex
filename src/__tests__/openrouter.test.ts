@@ -261,6 +261,42 @@ describe('OpenRouterClient.chat — errors', () => {
             client.chat(DEFAULT_PRESET, [{ role: 'user', content: 'hi' }]),
         ).rejects.toBeInstanceOf(OpenRouterError);
     });
+
+    it('marks 429 as retryable', async () => {
+        mockFetch({}, 429);
+        const client = makeClient();
+        const err = await client
+            .chat(DEFAULT_PRESET, [{ role: 'user', content: 'hi' }])
+            .catch((e) => e) as OpenRouterError;
+        expect(err.isRetryable).toBe(true);
+    });
+
+    it('marks 500+ as retryable', async () => {
+        mockFetch({}, 503);
+        const client = makeClient();
+        const err = await client
+            .chat(DEFAULT_PRESET, [{ role: 'user', content: 'hi' }])
+            .catch((e) => e) as OpenRouterError;
+        expect(err.isRetryable).toBe(true);
+    });
+
+    it('marks 401 as not retryable', async () => {
+        mockFetch({}, 401);
+        const client = makeClient();
+        const err = await client
+            .chat(DEFAULT_PRESET, [{ role: 'user', content: 'hi' }])
+            .catch((e) => e) as OpenRouterError;
+        expect(err.isRetryable).toBe(false);
+    });
+
+    it('marks 400 as not retryable', async () => {
+        mockFetch({}, 400);
+        const client = makeClient();
+        const err = await client
+            .chat(DEFAULT_PRESET, [{ role: 'user', content: 'hi' }])
+            .catch((e) => e) as OpenRouterError;
+        expect(err.isRetryable).toBe(false);
+    });
 });
 
 // ---------------------------------------------------------------------------

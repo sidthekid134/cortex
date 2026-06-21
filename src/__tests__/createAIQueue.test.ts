@@ -26,6 +26,8 @@ describe('createAIQueue', () => {
         expect(typeof ai.hasPending).toBe('function');
         expect(typeof ai.getStats).toBe('function');
         expect(typeof ai.subscribe).toBe('function');
+        expect(typeof ai.drain).toBe('function');
+        expect(typeof ai.destroy).toBe('function');
         expect(typeof ai.structured).toBe('function');
         expect(typeof ai.text).toBe('function');
     });
@@ -70,6 +72,24 @@ describe('createAIQueue', () => {
         await ai.enqueue('test', async () => 'done');
     });
 
+    it('drain() resolves when queue is empty', async () => {
+        const ai = makeAI();
+        await expect(ai.drain()).resolves.toBeUndefined();
+    });
+
+    it('destroy() prevents further enqueue calls', async () => {
+        const ai = makeAI();
+        ai.destroy();
+        await expect(ai.enqueue('after', async () => {})).rejects.toThrow();
+    });
+
+    it('getStats() includes runningLabels', () => {
+        const ai = makeAI();
+        const stats = ai.getStats();
+        expect(Array.isArray(stats.runningLabels)).toBe(true);
+        expect(stats.runningLabels).toHaveLength(0);
+    });
+
     it('calls onUsage when a structured call succeeds', async () => {
         vi.spyOn(OpenRouterClient.prototype, 'chat').mockResolvedValue({
             content: JSON.stringify({ name: 'test', value: 1 }),
@@ -85,6 +105,29 @@ describe('createAIQueue', () => {
 
         expect(usageEvents).toHaveLength(1);
         vi.restoreAllMocks();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Config validation
+// ---------------------------------------------------------------------------
+
+describe('createAIQueue — config validation', () => {
+    it('throws when apiKey is missing', () => {
+        expect(() => createAIQueue({ apiKey: '' })).toThrow('apiKey');
+    });
+
+    it('throws when concurrency.base is not a positive integer', () => {
+        expect(() => createAIQueue({ apiKey: 'k', concurrency: { base: 0 } })).toThrow('concurrency.base');
+        expect(() => createAIQueue({ apiKey: 'k', concurrency: { base: 1.5 } })).toThrow('concurrency.base');
+    });
+
+    it('throws when concurrency.burst is negative', () => {
+        expect(() => createAIQueue({ apiKey: 'k', concurrency: { burst: -1 } })).toThrow('concurrency.burst');
+    });
+
+    it('accepts valid concurrency values', () => {
+        expect(() => createAIQueue({ apiKey: 'k', concurrency: { base: 5, burst: 0, slowOp: 2 } })).not.toThrow();
     });
 });
 
