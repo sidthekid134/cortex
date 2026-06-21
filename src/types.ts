@@ -30,7 +30,7 @@ export interface Logger {
 export interface Preset {
     /**
      * Primary model identifier (OpenRouter format: `"provider/model-name"`).
-     * @example "google/gemini-2.0-flash"
+     * @example "google/gemini-2.5-flash"
      */
     model: string;
     /**

@@ -15,8 +15,8 @@ export const DEFAULT_PRESETS: PresetMap = {
      * Falls back to a smaller variant then GPT-4o-mini on error.
      */
     'fast-vision': {
-        model: 'google/gemini-2.0-flash',
-        fallbacks: ['google/gemini-2.0-flash-lite', 'openai/gpt-4o-mini'],
+        model: 'google/gemini-2.5-flash',
+        fallbacks: ['google/gemini-2.5-flash-lite', 'openai/gpt-4o-mini'],
         temperature: 0.2,
         maxTokens: 2048,
     },
@@ -27,7 +27,7 @@ export const DEFAULT_PRESETS: PresetMap = {
      * Falls back to GPT-4o-mini then a free Llama variant.
      */
     'cheap-text': {
-        model: 'google/gemini-2.0-flash-lite',
+        model: 'google/gemini-2.5-flash-lite',
         fallbacks: ['openai/gpt-4o-mini', 'meta-llama/llama-3.1-8b-instruct:free'],
         temperature: 0.1,
         maxTokens: 1024,
