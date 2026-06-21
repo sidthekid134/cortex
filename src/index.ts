@@ -27,6 +27,31 @@ export type {
 } from './types.js';
 
 // ---------------------------------------------------------------------------
+// Agent / tool-calling types
+// ---------------------------------------------------------------------------
+export type {
+    AgentTool,
+    AgentToolResult,
+    AgentToolRecord,
+    AgentMessage,
+    AgentParams,
+    AgentResult,
+} from './types.js';
+
+// ---------------------------------------------------------------------------
+// Provider abstraction (for registering on-device or custom providers)
+// ---------------------------------------------------------------------------
+export type {
+    Provider,
+    ProviderCapabilities,
+    ProviderChatParams,
+    ProviderChatResult,
+    OnDeviceProvider,
+} from './provider.js';
+
+export { noOpOnDeviceProvider } from './provider.js';
+
+// ---------------------------------------------------------------------------
 // Errors — import these to distinguish abort/cancel from real failures
 // ---------------------------------------------------------------------------
 

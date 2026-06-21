@@ -1,10 +1,13 @@
-import type { CortexConfig, StructuredParams, TextParams, UsageEvent } from './types.js';
+import type { CortexConfig, StructuredParams, TextParams, UsageEvent, AgentParams, AgentResult } from './types.js';
 import type { ZodTypeAny } from 'zod';
 import type { z } from 'zod';
 import { AIOperationQueue, isAIAbortError, AIOperationCancelledError } from './queue.js';
 import { OpenRouterClient } from './openrouter.js';
 import { resolvePresets } from './presets.js';
 import { structured, text } from './structured.js';
+import { OpenRouterProvider, ProviderRouter, noOpOnDeviceProvider } from './provider.js';
+import type { Provider } from './provider.js';
+import { runAgentLoop } from './agent.js';
 import type { AIOperationOptions, QueueStats, QueueListener } from './types.js';
 import type { AITaskContext } from './types.js';
 
@@ -117,6 +120,41 @@ export interface CortexInstance {
      * @throws {OpenRouterError} on HTTP errors.
      */
     text(params: TextParams): Promise<string>;
+
+    /**
+     * Run a multi-turn tool-calling agent loop using the registered provider.
+     *
+     * This is a direct call — it is not automatically queued. Wrap it in
+     * `enqueue()` to get priority scheduling, deduplication, and cancellation:
+     *
+     * ```ts
+     * ai.enqueue('coach:recommend', async (ctx) =>
+     *   ai.agent({ preset: 'coaching', system, messages, tools, signal: ctx.signal }),
+     *   { group: sessionId, dedupeKey: `coaching:${type}`, priority: 40 },
+     * );
+     * ```
+     *
+     * @throws {AIOperationCancelledError} when the signal is aborted mid-loop.
+     * @throws {OpenRouterError} on non-retryable HTTP errors.
+     */
+    agent<TContext = unknown, TEffect = unknown>(
+        params: AgentParams<TContext, TEffect>,
+    ): Promise<AgentResult<TEffect>>;
+
+    /**
+     * Register an additional LLM provider (e.g. an on-device runtime).
+     * The registered provider can be requested by setting `provider` in
+     * `AgentParams`. The router falls back to the cloud (OpenRouter) provider
+     * when the registered one is unavailable or lacks required capabilities.
+     *
+     * Register the on-device provider at app startup once runtime availability,
+     * tool support, and performance characteristics are confirmed:
+     *
+     * ```ts
+     * ai.registerProvider(myOnDeviceProvider);
+     * ```
+     */
+    registerProvider(provider: Provider): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +222,13 @@ export function createAIQueue(config: CortexConfig): CortexInstance {
         logger,
     });
 
+    const cloudProvider = new OpenRouterProvider(client);
+    const router = new ProviderRouter(cloudProvider, logger);
+
+    // Register the no-op on-device stub so the provider ID is known.
+    // Replace with a real implementation via registerProvider() at runtime.
+    router.registerProvider(noOpOnDeviceProvider);
+
     const onUsage: ((e: UsageEvent) => void) | undefined = config.onUsage;
 
     return {
@@ -201,6 +246,13 @@ export function createAIQueue(config: CortexConfig): CortexInstance {
         // LLM helpers
         structured: (params) => structured(params, presets, client, queue, onUsage, logger),
         text: (params) => text(params, presets, client, queue, onUsage, logger),
+
+        // Agent loop
+        agent: <TContext, TEffect>(params: AgentParams<TContext, TEffect>) =>
+            runAgentLoop(params, router, presets, onUsage, logger),
+
+        // Provider management
+        registerProvider: (provider) => router.registerProvider(provider),
     };
 }
 

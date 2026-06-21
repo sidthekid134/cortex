@@ -5,9 +5,41 @@ import { noopLogger } from './logger.js';
 // OpenRouter wire types
 // ---------------------------------------------------------------------------
 
+// Tool spec sent to the model (OpenAI / OpenRouter function-calling format).
+export interface ToolSpec {
+    type: 'function';
+    function: {
+        name: string;
+        description?: string;
+        parameters: Record<string, unknown>;
+    };
+}
+
+export type ToolChoice =
+    | 'auto'
+    | 'none'
+    | 'required'
+    | { type: 'function'; function: { name: string } };
+
+// A single tool call emitted by the model in an assistant message.
+export interface ToolCallWire {
+    id: string;
+    type: 'function';
+    function: {
+        name: string;
+        /** JSON-encoded argument object. */
+        arguments: string;
+    };
+}
+
 export interface ChatMessage {
-    role: 'system' | 'user' | 'assistant';
-    content: string | ContentPart[];
+    role: 'system' | 'user' | 'assistant' | 'tool';
+    /** null is valid for assistant messages that contain only tool_calls. */
+    content: string | ContentPart[] | null;
+    /** Tool calls emitted by the model (assistant role only). */
+    tool_calls?: ToolCallWire[];
+    /** Ties a tool result back to the original tool call (tool role only). */
+    tool_call_id?: string;
 }
 
 export type ContentPart = TextPart | ImageUrlPart;
@@ -40,6 +72,9 @@ export interface ChatRequest {
     response_format?: ResponseFormat;
     plugins?: Array<{ id: string }>;
     usage?: { include: true };
+    tools?: ToolSpec[];
+    tool_choice?: ToolChoice;
+    parallel_tool_calls?: boolean;
 }
 
 export interface ChatUsage {
@@ -52,9 +87,11 @@ export interface ChatUsage {
 
 export interface ChatResponse {
     choices: Array<{
+        finish_reason?: string;
         message: {
             content: string | null;
             role: string;
+            tool_calls?: ToolCallWire[];
         };
     }>;
     model?: string;
@@ -64,6 +101,16 @@ export interface ChatResponse {
 export interface ChatResult {
     content: string;
     /** The model that actually responded (may differ from preset.model if a fallback was used). */
+    model: string;
+    usage: ChatUsage;
+}
+
+/** Result returned by chatWithTools() — supports both text and tool-call responses. */
+export interface ToolChatResult {
+    /** Text content from the model, or null when the response contains only tool calls. */
+    content: string | null;
+    toolCalls: ToolCallWire[];
+    finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter';
     model: string;
     usage: ChatUsage;
 }
@@ -172,6 +219,98 @@ export class OpenRouterClient {
             usage,
         };
     }
+
+    /**
+     * Make a tool-aware chat request. Unlike `chat()`, this method:
+     * - Sends tool definitions and tool-call results using the OpenAI function-calling wire format.
+     * - Accepts assistant messages with null content (model emitted only tool calls).
+     * - Returns the finish reason and any tool calls emitted by the model.
+     *
+     * Use this inside an agent loop. For structured output without tools, use `chat()` instead.
+     */
+    async chatWithTools(
+        preset: Preset,
+        messages: ChatMessage[],
+        options?: {
+            tools?: ToolSpec[];
+            toolChoice?: ToolChoice;
+            parallelToolCalls?: boolean;
+            signal?: AbortSignal;
+        },
+    ): Promise<ToolChatResult> {
+        const body: ChatRequest = {
+            model: preset.model,
+            ...(preset.fallbacks?.length ? { models: [preset.model, ...preset.fallbacks] } : {}),
+            messages,
+            ...(preset.temperature !== undefined ? { temperature: preset.temperature } : {}),
+            ...(preset.maxTokens !== undefined ? { max_tokens: preset.maxTokens } : {}),
+            usage: { include: true },
+            ...(options?.tools?.length ? { tools: options.tools } : {}),
+            ...(options?.toolChoice !== undefined ? { tool_choice: options.toolChoice } : {}),
+            ...(options?.parallelToolCalls !== undefined
+                ? { parallel_tool_calls: options.parallelToolCalls }
+                : {}),
+        };
+
+        const toolNote = options?.tools?.length ? ` · ${options.tools.length} tool(s)` : '';
+        const fallbackNote = preset.fallbacks?.length
+            ? ` (+${preset.fallbacks.length} fallback${preset.fallbacks.length > 1 ? 's' : ''})`
+            : '';
+        this.logger.debug(`→ ${preset.model}${fallbackNote}${toolNote} · ${messages.length} msg(s)`);
+
+        const startedAt = Date.now();
+        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: this.headers,
+            body: JSON.stringify(body),
+            signal: options?.signal,
+        });
+
+        if (!response.ok) {
+            let detail = '';
+            try { detail = await response.text(); } catch { /* ignore */ }
+            const isRetryable = response.status === 429 || response.status >= 500;
+            this.logger.error(
+                `← HTTP ${response.status} ${response.statusText}${isRetryable ? ' (retryable)' : ''}${detail ? ` — ${detail.slice(0, 300)}` : ''}`,
+            );
+            throw new OpenRouterError(
+                `OpenRouter ${response.status}: ${response.statusText}${detail ? ` — ${detail}` : ''}`,
+                response.status,
+                isRetryable,
+            );
+        }
+
+        const data = (await response.json()) as ChatResponse;
+        const choice = data.choices?.[0];
+        if (!choice) {
+            throw new OpenRouterError('OpenRouter returned no choices', 0, false);
+        }
+
+        const durationMs = Date.now() - startedAt;
+        const usage = data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+        const toolCalls = choice.message.tool_calls ?? [];
+        const rawFinish = choice.finish_reason ?? 'stop';
+        const finishReason = normalizeFinishReason(rawFinish);
+
+        this.logger.debug(
+            `← ${data.model ?? preset.model} · ${usage.total_tokens} tokens (↑${usage.prompt_tokens} ↓${usage.completion_tokens})${usage.cost !== undefined ? ` · $${usage.cost.toFixed(6)}` : ''} · ${durationMs}ms · ${finishReason}${toolCalls.length ? ` · ${toolCalls.length} tool call(s)` : ''}`,
+        );
+
+        return {
+            content: choice.message.content ?? null,
+            toolCalls,
+            finishReason,
+            model: data.model ?? preset.model,
+            usage,
+        };
+    }
+}
+
+function normalizeFinishReason(raw: string): ToolChatResult['finishReason'] {
+    if (raw === 'tool_calls') return 'tool_calls';
+    if (raw === 'length' || raw === 'max_tokens') return 'length';
+    if (raw === 'content_filter') return 'content_filter';
+    return 'stop';
 }
 
 // ---------------------------------------------------------------------------

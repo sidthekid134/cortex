@@ -281,6 +281,122 @@ export interface ConcurrencyConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Agent / tool-calling types
+// ---------------------------------------------------------------------------
+
+/**
+ * The result of a single tool execution. `result` is the string fed back to
+ * the model; `effect` / `effects` are opaque domain values passed to `onToolBatch`
+ * and returned in the final AgentResult.
+ */
+export interface AgentToolResult<TEffect = unknown> {
+    result: string;
+    effect?: TEffect;
+    effects?: TEffect[];
+}
+
+/**
+ * A tool registered with the agent loop.
+ *
+ * `readOnly` controls whether the tool may run concurrently with other tools
+ * in the same turn. When `true` (or when the function returns `true`), the
+ * tool is batched with other adjacent read-only calls and executed in
+ * parallel. When `false` or omitted, the tool executes serially in LLM-emitted
+ * order, and the tool context is refreshed before each execution so later tools
+ * can observe state changes made by earlier ones.
+ */
+export interface AgentTool<TContext = unknown, TEffect = unknown> {
+    name: string;
+    description: string;
+    /** JSON Schema object describing the tool's input parameters. */
+    parameters: Record<string, unknown>;
+    execute(args: Record<string, unknown>, context: TContext): Promise<AgentToolResult<TEffect>>;
+    /**
+     * Whether this tool is safe to run concurrently with other read-only tools.
+     * Pass a function for action-level classification (e.g. dispatcher tools
+     * that mix reads and writes behind an `action` argument).
+     */
+    readOnly?: boolean | ((args: Record<string, unknown>) => boolean);
+}
+
+/** A completed tool execution record returned in AgentResult and passed to onToolBatch. */
+export interface AgentToolRecord<TEffect = unknown> {
+    name: string;
+    args: Record<string, unknown>;
+    result: string;
+    effect?: TEffect;
+    effects?: TEffect[];
+}
+
+/** A plain text message in the agent's conversation. */
+export interface AgentMessage {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
+/** Parameters for a single agent run. Pass `signal` from `ctx.signal` inside `enqueue()`. */
+export interface AgentParams<TContext = unknown, TEffect = unknown> {
+    /** Preset name to resolve the model + parameters for every LLM turn. */
+    preset: string;
+    /**
+     * Optional preferred provider ID (e.g. `'on-device'`). The router falls
+     * back to the cloud provider when the preferred one is unavailable or
+     * lacks the required capabilities.
+     */
+    provider?: string;
+    system: string;
+    messages: AgentMessage[];
+    tools: AgentTool<TContext, TEffect>[];
+    /**
+     * Called before each mutating tool execution so later tools observe state
+     * updated by earlier writes in the same turn.
+     */
+    getToolContext?: () => TContext | Promise<TContext>;
+    /**
+     * Static tool context. Use when context does not change within a loop run.
+     * Ignored if `getToolContext` is also supplied.
+     */
+    toolContext?: TContext;
+    /**
+     * Called after each batch of tool executions (one batch per turn).
+     * Use for domain-specific side effects — refreshing stores, logging, etc.
+     * Runs before the next LLM turn begins.
+     */
+    onToolBatch?: (batch: AgentToolRecord<TEffect>[]) => Promise<void>;
+    /** Maximum number of LLM turns before the loop is forcibly stopped. Default: 12. */
+    maxTurns?: number;
+    /**
+     * Tool choice hint passed to the model on every turn.
+     * - `'auto'` (default): model decides whether to call tools.
+     * - `'required'`: model must call at least one tool. Useful for recommendation
+     *   tasks where you know a tool call is always expected.
+     * - `'none'`: disable tool calling for this run (tools still appear in the
+     *   schema but the model will not call them).
+     */
+    toolChoice?: 'auto' | 'required' | 'none';
+    /**
+     * Cancellation signal. Pass `ctx.signal` from the surrounding `enqueue()`
+     * task so cancelling the queued task also aborts the in-flight LLM request
+     * and stops the loop.
+     */
+    signal?: AbortSignal;
+}
+
+/** Returned by ai.agent() on successful completion. */
+export interface AgentResult<TEffect = unknown> {
+    text: string;
+    effects: TEffect[];
+    toolCalls: AgentToolRecord<TEffect>[];
+    /** Aggregate token usage across all turns in this agent run. */
+    usage: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        estimatedCostUsd: number;
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Main library config
 // ---------------------------------------------------------------------------
 
