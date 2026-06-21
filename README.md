@@ -1,17 +1,108 @@
 # @sid/cortex
 
-A self-contained, React Native / Expo-safe TypeScript library that pairs a UX-aware AI operation queue with a thin OpenRouter-backed structured-call layer.
+A UX-aware LLM job queue + OpenRouter integration layer for React Native / Expo apps.
+
+Most apps fire LLM calls directly and end up managing a tangle of race conditions, duplicate requests, stale results, and no visibility into cost. Cortex puts a scheduler between your app and the model so you get **priority, deduplication, group cancellation, structured output with retries, and per-call cost telemetry**—without writing any of that infrastructure yourself.
 
 **The app owns:** orchestration (what to enqueue and when), prompts, Zod schemas, and all UI state.  
 **Cortex owns:** scheduling, priority, dedupe, group-cancellation, calling OpenRouter, JSON parsing/validation, presets, and cost telemetry.
 
-Runtime dependency: `zod` (peer). No Vercel AI SDK, no provider SDKs, no Node-only APIs.
+Runtime dependency: `zod` (peer). No Vercel AI SDK, no provider SDKs, no Node-only APIs — just `fetch` and `AbortSignal`.
+
+---
+
+## The problem it solves
+
+A typical feed-based app triggers an LLM call for each item a user scrolls past. Without a scheduler:
+
+```
+User scrolls past items A → B → C → D
+
+  A ──────────────────────────────────────► response (stale, user left)
+    B ─────────────────────────────────────► response (stale)
+      C ──────────────────────────────────► response (stale)
+        D ──────────────────────────────────► response ✓
+
+  5 inflight requests. All run at equal priority.
+  A/B/C waste tokens and cost money. D is no faster.
+```
+
+With Cortex:
+
+```
+User scrolls past items A → B → C → D
+setFocusedGroup(D) on navigation
+
+  A ──► cancelled (group cancelled on navigate)
+  B ──► cancelled
+  C ──► cancelled
+  D ──────────────────────────────────────► response ✓
+
+  1 inflight request. D runs immediately in a burst slot.
+  Zero wasted tokens.
+```
+
+---
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Client App                             │
+│  prompts · schemas · when to enqueue · UI state · tools     │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  ai.enqueue(label, task, { group, priority, dedupeKey })
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Cortex (AIOperationQueue)                 │
+│                                                             │
+│   Priority queue                                            │
+│   ┌──────────────────────────────────────────────────────┐  │
+│   │  urgent (priority ≥ 90)  ──► burst slots (up to 5)  │  │
+│   │  focused group           ──► bumped to front         │  │
+│   │  background (default)    ──► base slots (up to 3)    │  │
+│   │  slow ops                ──► slow slots (up to 2)    │  │
+│   └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│   Deduplication                                             │
+│   ┌──────────────────────────────────────────────────────┐  │
+│   │  same dedupeKey pending  → bump priority, share       │  │
+│   │  same dedupeKey running  → attach (or restart)       │  │
+│   └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│   Cancellation                                              │
+│   ┌──────────────────────────────────────────────────────┐  │
+│   │  cancelGroup(id)   → abort all ops in group          │  │
+│   │  cancelKey(key)    → abort by dedupe key             │  │
+│   │  isStillValid()    → skip before run                 │  │
+│   └──────────────────────────────────────────────────────┘  │
+└──────────────────┬──────────────────────────────────────────┘
+                   │  structured() / text() / agent()
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│                OpenRouter (/chat/completions)                │
+│         Zod → JSON Schema · validate · retry · telemetry    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Key capabilities
+
+| Capability | How it works |
+|---|---|
+| **Priority scheduling** | Higher priority runs first; FIFO within same level |
+| **Focus-aware bursting** | `setFocusedGroup()` bumps that group to front + opens burst concurrency slots |
+| **Deduplication** | Same `dedupeKey` pending → bump + share promise; running → attach or `restart` |
+| **Group cancellation** | `cancelGroup(id)` aborts all queued and running ops in a group |
+| **Structured output** | Zod schema → JSON Schema → parse/validate → retry with corrective prompt on failure |
+| **Tool-calling agent** | Multi-turn loop; read-only tools run parallel, mutating tools serial |
+| **Cost telemetry** | Per-call `UsageEvent` (tokens, cost, duration) + session aggregate via `getStats()` |
+| **Provider abstraction** | OpenRouter default; plug in on-device models via `registerProvider()` |
 
 ---
 
 ## Install
-
-Add as a git dependency:
 
 ```json
 "dependencies": {
@@ -34,12 +125,10 @@ const ai = createAIQueue({
   onUsage: (e) => console.log(`${e.preset} → ${e.model} | $${e.costUsd} | ${e.durationMs}ms`),
 });
 
-// Define your schema and prompt in the app
 const FoodSchema = z.object({
   items: z.array(z.object({ name: z.string(), calories: z.number() })),
 });
 
-// Enqueue work — the app controls when and what to enqueue
 const result = await ai.enqueue(
   'recognize-food',
   async (ctx) => {
@@ -49,7 +138,7 @@ const result = await ai.enqueue(
       system: 'You are a food recognition assistant. Return JSON only.',
       prompt: 'What food items are in this image? Include estimated calories.',
       images: [{ base64: myBase64Image, mimeType: 'image/jpeg' }],
-      signal: ctx.signal,  // always pass signal through for cancellation
+      signal: ctx.signal,
     });
   },
   {
@@ -102,6 +191,19 @@ Add a task to the queue. Returns a promise that resolves/rejects when the task c
 
 Mark the group the user is actively viewing. Its queued operations are sorted to the front and may run in burst concurrency slots without cancelling already-running work.
 
+```
+Before setFocusedGroup('item-3'):        After setFocusedGroup('item-3'):
+
+  Queue (FIFO):                            Queue (priority-sorted):
+  1. item-1:recognize   [p=50]             1. item-3:recognize   [p=50, focused ↑]
+  2. item-2:recognize   [p=50]             2. item-3:details     [p=30, focused ↑]
+  3. item-3:recognize   [p=50]             3. item-1:recognize   [p=50]
+  4. item-3:details     [p=30]             4. item-2:recognize   [p=50]
+
+  Running: item-1:recognize (keeps running — no disruption)
+  New burst slot opens for item-3 work immediately
+```
+
 ### `ai.cancelGroup(group, reason?)`
 
 Cancel all queued and running operations belonging to a group.
@@ -117,6 +219,24 @@ Returns `true` if any operation with this dedupe key is queued or running.
 ### `ai.getStats()`
 
 Returns current queue statistics including aggregate token usage and cost.
+
+```ts
+const stats = ai.getStats();
+// {
+//   runningOperations: 2,
+//   pendingOperations: 5,
+//   completedOperations: 14,
+//   failedOperations: 0,
+//   skippedOperations: 3,
+//   cancelledOperations: 6,
+//   usage: {
+//     totalTokens: 48200,
+//     promptTokens: 41000,
+//     completionTokens: 7200,
+//     estimatedCostUsd: 0.0097,
+//   }
+// }
+```
 
 ### `ai.subscribe(listener)`
 
@@ -140,17 +260,44 @@ Both helpers are designed to be called **inside** a queued task so `ctx.signal` 
 ### `ai.structured({ preset, schema, system?, prompt, images?, web?, signal?, maxRetries? })`
 
 Makes a structured LLM call. Flow:
-1. Converts the Zod schema to JSON Schema via `z.toJSONSchema`.
-2. Posts to OpenRouter with `response_format: json_schema`.
-3. Parses and validates the response with `schema.parse`.
-4. On parse/validation failure, retries up to `maxRetries` (default: 1) with a corrective message.
-5. Records usage via `onUsage`.
+
+```
+  prompt + Zod schema
+        │
+        ▼
+  z.toJSONSchema(schema)
+        │
+        ▼
+  POST /chat/completions
+  response_format: json_schema
+        │
+        ▼
+  JSON.parse + schema.parse
+        │
+    ┌───┴───┐
+  valid   invalid
+    │         │
+    ▼         ▼ (up to maxRetries, default 1)
+  return   retry with corrective message
+             │
+          ┌──┴──┐
+        valid  invalid
+          │       │
+          ▼       ▼
+        return  throw StructuredOutputError
+```
 
 Returns `z.infer<typeof schema>`.
 
 ### `ai.text({ preset, system?, prompt, images?, web?, signal? })`
 
-Makes a plain-text LLM call. Returns the raw string response. No schema validation — the app post-processes the result.
+Makes a plain-text LLM call. Returns the raw string response.
+
+### `ai.agent({ preset, tools, system?, prompt, signal?, maxTurns? })`
+
+Multi-turn tool-calling loop (default max 12 turns). Read-only tools run in parallel per turn; mutating tools run serially. Pass a `onToolBatch` hook to react to each batch of tool results.
+
+> Agent inner turns bypass the queue intentionally to avoid self-deadlock on concurrency limits.
 
 ---
 
@@ -160,9 +307,9 @@ Makes a plain-text LLM call. Returns the raw string response. No schema validati
 
 | Name | Model | Best for |
 |------|-------|---------|
-| `fast-vision` | `google/gemini-flash-1.5` | Image description, food recognition, low-latency vision |
-| `cheap-text` | `google/gemini-flash-1.5-8b` | Classification, short extraction, text-only tasks |
-| `reasoning` | `google/gemini-pro-1.5` | Grounded search, multi-step reasoning, menu matching |
+| `fast-vision` | `google/gemini-2.5-flash` | Image description, food recognition, low-latency vision |
+| `cheap-text` | `google/gemini-2.5-flash-lite` | Classification, short extraction, text-only tasks |
+| `reasoning` | `google/gemini-2.5-pro` | Grounded search, multi-step reasoning, web lookups |
 
 All presets include fallback chains across providers.
 
@@ -174,7 +321,7 @@ const ai = createAIQueue({
   presets: {
     'my-custom': { model: 'openai/gpt-4o', temperature: 0.5 },
     // Override a default:
-    'fast-vision': { model: 'google/gemini-flash-2.0', fallbacks: [] },
+    'fast-vision': { model: 'google/gemini-2.5-flash', fallbacks: [] },
   },
 });
 ```
@@ -202,13 +349,23 @@ Cortex maps this to OpenRouter's web plugin (`plugins: [{ id: 'web' }]`). The mo
 ## Error handling
 
 ```ts
-import { isAIAbortError } from '@sid/cortex';
+import { isAIAbortError, StructuredOutputError, OpenRouterError } from '@sid/cortex';
 
 ai.enqueue('my-task', async (ctx) => {
   // ...
 }).catch((error) => {
   if (isAIAbortError(error)) {
     // Normal: cancelled by group/key cancellation or setFocusedGroup change
+    return;
+  }
+  if (error instanceof StructuredOutputError) {
+    // Exhausted retries — error.cause has the last Zod validation error
+    console.error('Schema validation failed after retries:', error.cause);
+    return;
+  }
+  if (error instanceof OpenRouterError) {
+    // HTTP error — error.status, error.isRetryable (true for 429 / 5xx)
+    console.error(`OpenRouter ${error.status}:`, error.message);
     return;
   }
   console.error('Task failed:', error);
@@ -253,3 +410,30 @@ const ai = createAIQueue({
 ```
 
 Bring your own logger by implementing the `Logger` interface.
+
+---
+
+## Concurrency reference
+
+```
+Default concurrency limits:
+
+  ┌──────────────────────────────────────────────────────┐
+  │                   Max 5 total slots                  │
+  │                                                      │
+  │  [ base slot ][ base slot ][ base slot ]             │  ← 3 base slots (all ops)
+  │  [ burst slot ][ burst slot ]                        │  ← +2 for urgent / focused group
+  │                                                      │
+  │  slow ops: max 2 of the 3 base slots                 │
+  │  (so at least 1 slot always free for fast ops)       │
+  └──────────────────────────────────────────────────────┘
+
+Priority thresholds:
+
+  0        50        90       100
+  │────────│─────────│────────│
+  bg      normal   urgent   max
+                     ↑
+              interactiveThreshold
+              (opens burst slots)
+```
